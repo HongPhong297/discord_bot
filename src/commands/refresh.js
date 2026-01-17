@@ -6,6 +6,7 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const db = require('../services/database');
 const { checkForNewMatches, checkMatchesForUser } = require('../features/postGameAnalysis');
+const { syncUserRank } = require('../features/rankSync');
 const { createSuccessEmbed, createErrorEmbed, createInfoEmbed } = require('../utils/embedBuilder');
 const log = require('../utils/logger');
 
@@ -58,12 +59,19 @@ module.exports = {
       } else {
         // Check only the caller's matches (new default behavior)
         const loadingEmbed = createInfoEmbed(
-          'Checking your matches...',
-          `Scanning your recent matches, <@${userId}>. This may take a moment...`
+          'Checking your matches & rank...',
+          `Scanning your recent matches and syncing rank, <@${userId}>. This may take a moment...`
         );
         await interaction.editReply({ embeds: [loadingEmbed] });
 
-        const result = await checkMatchesForUser(interaction.client, userId);
+        // Run match check and rank sync in parallel for speed
+        const [result, rankResult] = await Promise.all([
+          checkMatchesForUser(interaction.client, userId),
+          syncUserRank(interaction.client, userId).catch(err => {
+            log.error('Error syncing rank during refresh', err);
+            return { error: err.message };
+          }),
+        ]);
 
         // Build result message
         let description = `Checked **${result.checked}** recent matches.\n`;
@@ -80,6 +88,16 @@ module.exports = {
           if (result.skippedNotEnoughPlayers > 0) {
             description += `\n• ${result.skippedNotEnoughPlayers} had < 2 Discord members`;
           }
+        }
+
+        // Show rank sync result
+        description += '\n\n**Rank sync:**';
+        if (rankResult.error) {
+          description += `\n⚠️ Không thể sync rank: ${rankResult.error}`;
+        } else if (rankResult.changed) {
+          description += `\n🔄 Rank đã thay đổi: ${rankResult.oldRank} → **${rankResult.newRank}**`;
+        } else {
+          description += `\n✅ Rank không thay đổi (${rankResult.newRank || 'Unranked'})`;
         }
 
         // Show debug info if available

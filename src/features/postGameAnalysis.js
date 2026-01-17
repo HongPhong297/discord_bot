@@ -33,7 +33,9 @@ async function checkForNewMatches(client) {
     // Check each user's recent matches
     for (const user of users) {
       try {
-        const recentMatchIds = await riotApi.getMatchIdsByPuuid(user.riotPuuid, 5);
+        // Get recent matches with type filter from config (ranked only by default)
+        const matchType = config.features.postGame.matchType || null;
+        const recentMatchIds = await riotApi.getMatchIdsByPuuid(user.riotPuuid, 5, 0, user.region || config.riot.region, matchType);
         if (!recentMatchIds || recentMatchIds.length === 0) {
           continue;
         }
@@ -47,9 +49,51 @@ async function checkForNewMatches(client) {
           processedMatches.add(matchId);
 
           try {
-            // ATOMIC OPERATION: Try to claim this match for processing
-            // Uses findOneAndUpdate with upsert to prevent race conditions
-            // If match already exists (processed or being processed), this returns the existing doc
+            // First, check if match already exists in DB
+            const existingMatch = await db.models.Match.findOne({ matchId });
+            
+            if (existingMatch) {
+              // Match already exists - check if it's fully processed
+              if (existingMatch.participants && existingMatch.participants.length > 0) {
+                log.debug(`Match ${matchId} already fully processed, skipping`);
+                continue;
+              }
+              
+              // Match exists but not fully processed (stuck in processing state)
+              // Check if it's been stuck for too long (> 5 minutes)
+              if (existingMatch.claimedAt) {
+                const ageMinutes = (Date.now() - new Date(existingMatch.claimedAt).getTime()) / (1000 * 60);
+                if (ageMinutes < 5) {
+                  log.debug(`Match ${matchId} is being processed by another instance, skipping`);
+                  continue;
+                }
+                // Stuck too long, delete and reprocess
+                log.warn(`Match ${matchId} stuck for ${ageMinutes.toFixed(1)} min, cleaning up`);
+                await db.models.Match.deleteOne({ matchId });
+              } else {
+                // Has no claimedAt but also no participants - clean up
+                log.warn(`Match ${matchId} has incomplete data, cleaning up`);
+                await db.models.Match.deleteOne({ matchId });
+              }
+            }
+
+            // STEP 1: Get full match data from Riot API FIRST (before claiming)
+            const matchData = await riotApi.getMatchById(matchId);
+            if (!matchData) {
+              log.warn(`Failed to get match data for ${matchId}`);
+              continue;
+            }
+
+            // STEP 2: Check Discord members in match
+            const discordParticipants = await getDiscordParticipants(matchData);
+            
+            // Skip if no Discord members at all
+            if (discordParticipants.length === 0) {
+              log.debug(`Match ${matchId} has no Discord members, skipping`);
+              continue;
+            }
+
+            // STEP 3: Now try to claim the match atomically (with timestamp since we have it)
             const claimResult = await db.models.Match.findOneAndUpdate(
               { matchId },
               { 
@@ -57,45 +101,58 @@ async function checkForNewMatches(client) {
                   matchId, 
                   processing: true,
                   claimedAt: new Date(),
+                  timestamp: new Date(matchData.info.gameCreation),
                 }
               },
-              { 
-                upsert: true, 
-                new: true,
-                rawResult: true, // Get info about whether doc was inserted or found
-              }
+              { upsert: true, new: true }
             );
 
-            // If document already existed (not inserted), skip
-            // rawResult.lastErrorObject.updatedExisting = true means doc existed
-            if (claimResult.lastErrorObject && claimResult.lastErrorObject.updatedExisting) {
-              log.debug(`Match ${matchId} already processed or being processed, skipping`);
+            // If document already had participants, someone else processed it
+            if (claimResult.participants && claimResult.participants.length > 0) {
+              log.debug(`Match ${matchId} was already processed by another instance, skipping`);
               continue;
             }
 
-            // We claimed this match, now process it
-            log.debug(`Claimed match ${matchId} for processing`);
+            log.info(`Claimed match ${matchId} for processing`);
 
-            // Get full match data from Riot API
-            const matchData = await riotApi.getMatchById(matchId);
-            if (!matchData) {
-              // Failed to get match data, remove our claim
-              await db.models.Match.deleteOne({ matchId, processing: true });
-              continue;
+            // STEP 4: Handle based on number of Discord members
+            if (discordParticipants.length >= config.features.postGame.minPlayersRequired) {
+              // Multi-player game: Full analysis + leaderboard update (inside processMatch)
+              await processMatch(client, matchData, discordParticipants);
+              newMatchesProcessed++;
+            } else {
+              // Solo game: Update leaderboard only, no analysis posted
+              await updateLeaderboardStats(discordParticipants);
+              log.info(`Updated leaderboard stats for solo player`);
+              
+              // Mark match as processed without full analysis
+              await db.models.Match.findOneAndUpdate(
+                { matchId },
+                {
+                  $set: {
+                    participants: discordParticipants.map(p => ({
+                      discordId: p.discordId,
+                      puuid: p.puuid,
+                      summonerName: p.summonerName,
+                      championName: p.championName,
+                      kills: p.kills,
+                      deaths: p.deaths,
+                      assists: p.assists,
+                      win: p.win,
+                    })),
+                    gameDuration: matchData.info.gameDuration,
+                    gameMode: matchData.info.gameMode,
+                    queueId: matchData.info.queueId,
+                    timestamp: new Date(matchData.info.gameCreation),
+                    processing: false,
+                    processedAt: new Date(),
+                    soloGame: true, // Mark as solo game (no analysis posted)
+                  },
+                  $unset: { claimedAt: 1 },
+                }
+              );
+              log.info(`Match ${matchId} processed as solo game (leaderboard only, no analysis posted)`);
             }
-
-            // Check if match has 2+ Discord members
-            const discordParticipants = await getDiscordParticipants(matchData);
-            if (discordParticipants.length < config.features.postGame.minPlayersRequired) {
-              log.debug(`Match ${matchId} has only ${discordParticipants.length} Discord members, skipping`);
-              // Remove claim since we won't process this match
-              await db.models.Match.deleteOne({ matchId, processing: true });
-              continue;
-            }
-
-            // Process the match (this will update the document with full data)
-            await processMatch(client, matchData, discordParticipants);
-            newMatchesProcessed++;
 
             // Small delay to avoid rate limits
             await new Promise(resolve => setTimeout(resolve, 1000));
@@ -243,7 +300,7 @@ async function processMatch(client, matchData, discordParticipants) {
 
     // Save match to database
     // Update the claimed document (from atomic claim) with full match data
-    await db.models.Match.findOneAndUpdate(
+    const savedMatch = await db.models.Match.findOneAndUpdate(
       { matchId },
       {
         $set: {
@@ -261,9 +318,13 @@ async function processMatch(client, matchData, discordParticipants) {
           claimedAt: 1, // Remove temporary claim field
         },
       },
-      { upsert: true } // In case called directly without claim
+      { upsert: true, new: true }
     );
-    log.db('update', 'Match', true);
+    log.info(`Match ${matchId} saved to database`, {
+      docId: savedMatch._id?.toString(),
+      processing: savedMatch.processing,
+      participantsCount: savedMatch.participants?.length,
+    });
 
     // Update leaderboard stats
     await updateLeaderboardStats(participants);
@@ -434,10 +495,11 @@ async function settleBetsForMatch(client, matchId, participants, gameStartTime) 
 
       if (!betWindow) continue;
 
-      // Check if game STARTED within time window (40 minutes after bet opened)
+      // Check if game STARTED within time window (maxGameStartWindow minutes after bet opened)
       // Using gameStartTime (when player entered game) instead of current time
       // This fixes the bug where long games would exceed the time window
       const timeSinceBetOpened = (gameStartTime - betWindow.openedAt) / (1000 * 60); // minutes
+      const maxStartWindow = config.features.betting.maxGameStartWindow || 40; // Fallback to 40
 
       log.debug('Checking bet window timing', {
         matchId,
@@ -445,10 +507,10 @@ async function settleBetsForMatch(client, matchId, participants, gameStartTime) 
         betOpenedAt: betWindow.openedAt,
         gameStartTime,
         timeSinceBetOpened: timeSinceBetOpened.toFixed(2),
-        maxWaitTime: config.features.betting.maxMatchWaitTime,
+        maxGameStartWindow: maxStartWindow,
       });
 
-      if (timeSinceBetOpened >= 0 && timeSinceBetOpened <= config.features.betting.maxMatchWaitTime) {
+      if (timeSinceBetOpened >= 0 && timeSinceBetOpened <= maxStartWindow) {
         // This is the match for this bet window
         betWindow.matchId = matchId;
         betWindow.status = 'matched';
@@ -543,10 +605,12 @@ async function checkMatchesForUser(client, discordId) {
     log.info(`Found user: ${user.summonerName}, PUUID: ${user.riotPuuid?.substring(0, 20)}...`);
     result.debugInfo.push(`User: ${user.summonerName}`);
 
-    const recentMatchIds = await riotApi.getMatchIdsByPuuid(user.riotPuuid, 5);
+    // Get recent matches with type filter from config (ranked only by default)
+    const matchType = config.features.postGame.matchType || null;
+    const recentMatchIds = await riotApi.getMatchIdsByPuuid(user.riotPuuid, 5, 0, user.region || config.riot.region, matchType);
     if (!recentMatchIds || recentMatchIds.length === 0) {
-      log.info(`No recent matches found for user ${discordId}`);
-      result.debugInfo.push('No matches from Riot API');
+      log.info(`No recent ${matchType || 'any'} matches found for user ${discordId}`);
+      result.debugInfo.push(`No ${matchType || 'any'} matches from Riot API`);
       return result;
     }
 
@@ -555,68 +619,49 @@ async function checkMatchesForUser(client, discordId) {
 
     for (const matchId of recentMatchIds) {
       try {
-        // Check if match already exists in DB (for debugging)
+        // Check if match already exists in DB
         const existingMatch = await db.models.Match.findOne({ matchId });
         if (existingMatch) {
-          log.info(`Match ${matchId} status: processing=${existingMatch.processing}, hasParticipants=${!!existingMatch.participants}`);
+          log.info(`Match ${matchId} status: processing=${existingMatch.processing}, participantsCount=${existingMatch.participants?.length || 0}`);
           
-          // If stuck in processing state for too long, clean it up
-          if (existingMatch.processing && existingMatch.claimedAt) {
-            const ageMinutes = (Date.now() - existingMatch.claimedAt.getTime()) / (1000 * 60);
-            if (ageMinutes > 5) {
-              log.warn(`Match ${matchId} stuck in processing for ${ageMinutes.toFixed(1)} minutes, cleaning up...`);
-              await db.models.Match.deleteOne({ matchId, processing: true });
-              // Continue to reprocess
-            } else {
-              result.skippedAlreadyProcessed++;
-              result.debugInfo.push(`${matchId.slice(-8)}: processing (${ageMinutes.toFixed(1)}m ago)`);
-              continue;
-            }
-          } else if (existingMatch.participants && existingMatch.participants.length > 0) {
-            // Already fully processed
+          // Match already fully processed - has participants
+          if (existingMatch.participants && existingMatch.participants.length > 0) {
             result.skippedAlreadyProcessed++;
             result.debugInfo.push(`${matchId.slice(-8)}: already processed`);
             continue;
           }
-        }
-
-        // ATOMIC OPERATION: Try to claim this match for processing
-        const claimResult = await db.models.Match.findOneAndUpdate(
-          { matchId },
-          { 
-            $setOnInsert: { 
-              matchId, 
-              processing: true,
-              claimedAt: new Date(),
+          
+          // Match exists but not fully processed (stuck in processing state)
+          // Check if it's been stuck for too long (> 5 minutes)
+          if (existingMatch.claimedAt) {
+            const ageMinutes = (Date.now() - new Date(existingMatch.claimedAt).getTime()) / (1000 * 60);
+            if (ageMinutes < 5) {
+              log.debug(`Match ${matchId} is being processed by another instance (${ageMinutes.toFixed(1)}m ago), skipping`);
+              result.skippedAlreadyProcessed++;
+              result.debugInfo.push(`${matchId.slice(-8)}: processing (${ageMinutes.toFixed(1)}m ago)`);
+              continue;
             }
-          },
-          { 
-            upsert: true, 
-            new: true,
-            rawResult: true,
+            // Stuck too long, delete and reprocess
+            log.warn(`Match ${matchId} stuck for ${ageMinutes.toFixed(1)} min, cleaning up`);
+            await db.models.Match.deleteOne({ matchId });
+          } else {
+            // Has no claimedAt but also no participants - clean up (bug from previous version)
+            log.warn(`Match ${matchId} has incomplete data (empty participants, no claimedAt), cleaning up`);
+            await db.models.Match.deleteOne({ matchId });
           }
-        );
-
-        // If document already existed, skip
-        if (claimResult.lastErrorObject && claimResult.lastErrorObject.updatedExisting) {
-          log.debug(`Match ${matchId} already processed, skipping`);
-          result.skippedAlreadyProcessed++;
-          continue;
         }
 
-        log.info(`Claimed match ${matchId} for processing`);
-
-        // Get full match data from Riot API
+        // STEP 1: Get full match data from Riot API FIRST (before claiming)
+        // This way we know the timestamp before trying to save
         const matchData = await riotApi.getMatchById(matchId);
         if (!matchData) {
-          await db.models.Match.deleteOne({ matchId, processing: true });
           result.errors.push(`Failed to fetch match data for ${matchId.slice(-8)}`);
           continue;
         }
 
         log.info(`Got match data: ${matchData.info.participants.length} participants, queue: ${matchData.info.queueId}`);
 
-        // Check if match has 2+ Discord members
+        // STEP 2: Check Discord members in match
         const discordParticipants = await getDiscordParticipants(matchData);
         log.info(`Found ${discordParticipants.length} Discord members in match ${matchId}`);
         
@@ -627,19 +672,79 @@ async function checkMatchesForUser(client, discordId) {
           });
         }
 
-        if (discordParticipants.length < config.features.postGame.minPlayersRequired) {
-          log.info(`Match ${matchId} has only ${discordParticipants.length} Discord members (need ${config.features.postGame.minPlayersRequired}), skipping`);
-          await db.models.Match.deleteOne({ matchId, processing: true });
+        // Skip if no Discord members at all
+        if (discordParticipants.length === 0) {
+          log.info(`Match ${matchId} has no Discord members, skipping`);
           result.skippedNotEnoughPlayers++;
-          result.debugInfo.push(`${matchId.slice(-8)}: only ${discordParticipants.length} Discord member(s)`);
+          result.debugInfo.push(`${matchId.slice(-8)}: no Discord members`);
           continue;
         }
 
-        // Process the match
-        log.info(`Processing match ${matchId} with ${discordParticipants.length} Discord members...`);
-        await processMatch(client, matchData, discordParticipants);
-        result.newMatches++;
-        result.debugInfo.push(`${matchId.slice(-8)}: ✅ posted!`);
+        // STEP 3: Now try to claim the match atomically (with timestamp since we have it)
+        // Use findOneAndUpdate with $setOnInsert for atomic claim
+        const claimResult = await db.models.Match.findOneAndUpdate(
+          { matchId },
+          { 
+            $setOnInsert: { 
+              matchId, 
+              processing: true,
+              claimedAt: new Date(),
+              timestamp: new Date(matchData.info.gameCreation), // Include timestamp!
+            }
+          },
+          { upsert: true, new: true }
+        );
+
+        // If document already had participants, someone else processed it
+        if (claimResult.participants && claimResult.participants.length > 0) {
+          log.debug(`Match ${matchId} was already processed by another instance, skipping`);
+          result.skippedAlreadyProcessed++;
+          continue;
+        }
+
+        log.info(`Claimed match ${matchId} for processing`);
+
+        // STEP 4: Handle based on number of Discord members
+        if (discordParticipants.length >= config.features.postGame.minPlayersRequired) {
+          // Multi-player game: Full analysis + leaderboard update (inside processMatch)
+          log.info(`Processing match ${matchId} with ${discordParticipants.length} Discord members...`);
+          await processMatch(client, matchData, discordParticipants);
+          result.newMatches++;
+          result.debugInfo.push(`${matchId.slice(-8)}: posted!`);
+        } else {
+          // Solo game: Update leaderboard only, no analysis posted
+          await updateLeaderboardStats(discordParticipants);
+          log.info(`Updated leaderboard stats for solo player`);
+          
+          // Mark match as processed without full analysis
+          await db.models.Match.findOneAndUpdate(
+            { matchId },
+            {
+              $set: {
+                participants: discordParticipants.map(p => ({
+                  discordId: p.discordId,
+                  puuid: p.puuid,
+                  summonerName: p.summonerName,
+                  championName: p.championName,
+                  kills: p.kills,
+                  deaths: p.deaths,
+                  assists: p.assists,
+                  win: p.win,
+                })),
+                gameDuration: matchData.info.gameDuration,
+                gameMode: matchData.info.gameMode,
+                queueId: matchData.info.queueId,
+                timestamp: new Date(matchData.info.gameCreation),
+                processing: false,
+                processedAt: new Date(),
+                soloGame: true, // Mark as solo game (no analysis posted)
+              },
+              $unset: { claimedAt: 1 },
+            }
+          );
+          result.debugInfo.push(`${matchId.slice(-8)}: solo game (leaderboard only)`);
+          log.info(`Match ${matchId} processed as solo game (leaderboard only)`);
+        }
 
         // Small delay to avoid rate limits
         await new Promise(resolve => setTimeout(resolve, 1000));

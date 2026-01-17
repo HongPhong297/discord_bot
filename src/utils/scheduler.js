@@ -161,7 +161,7 @@ function startAllJobs(client) {
     autoRefreshMatches: () => checkForNewMatches(client),
     rankSync: () => syncAllRanks(client),
     roleCleanup: () => cleanupExpiredRoles(client),
-    betWindowCleanup: () => cleanupExpiredWindows(),
+    betWindowCleanup: () => cleanupExpiredWindows(client),
     weeklyLeaderboardReset: () => resetWeeklyLeaderboard(client),
     apiKeyReminder: () => sendApiKeyReminder(client),
   };

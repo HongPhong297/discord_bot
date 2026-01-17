@@ -66,10 +66,56 @@ const rateLimiter = new RateLimiter();
 class RiotApiClient {
   constructor() {
     this.baseUrls = {
+      // Regional routing endpoints (for Match-v5, Account-v1, etc.)
+      americas: 'https://americas.api.riotgames.com',
       asia: 'https://asia.api.riotgames.com',
+      europe: 'https://europe.api.riotgames.com',
+      sea: 'https://sea.api.riotgames.com', // Southeast Asia - for Vietnam, Singapore, etc.
+      
+      // Platform endpoints (for Summoner-v4, League-v4, etc.)
       vn2: 'https://vn2.api.riotgames.com',
+      sg2: 'https://sg2.api.riotgames.com',
+      th2: 'https://th2.api.riotgames.com',
+      tw2: 'https://tw2.api.riotgames.com',
+      ph2: 'https://ph2.api.riotgames.com',
+      
+      // Other regions
+      na1: 'https://na1.api.riotgames.com',
+      euw1: 'https://euw1.api.riotgames.com',
+      kr: 'https://kr.api.riotgames.com',
+      jp1: 'https://jp1.api.riotgames.com',
     };
     this.maxRetries = 3;
+    
+    // Map platform to regional routing
+    // Vietnam, Singapore, Thailand, Taiwan, Philippines -> SEA
+    // Korea, Japan -> ASIA
+    // NA, BR, LAN, LAS -> AMERICAS
+    // EUW, EUNE, TR, RU -> EUROPE
+    this.regionalRouting = {
+      vn2: 'sea',
+      sg2: 'sea',
+      th2: 'sea',
+      tw2: 'sea',
+      ph2: 'sea',
+      kr: 'asia',
+      jp1: 'asia',
+      na1: 'americas',
+      br1: 'americas',
+      la1: 'americas',
+      la2: 'americas',
+      euw1: 'europe',
+      eun1: 'europe',
+      tr1: 'europe',
+      ru: 'europe',
+    };
+  }
+
+  /**
+   * Get regional routing for a platform
+   */
+  getRegionalRouting(platform = 'vn2') {
+    return this.regionalRouting[platform.toLowerCase()] || 'sea';
   }
 
   /**
@@ -168,9 +214,17 @@ class RiotApiClient {
   /**
    * Build URL for API endpoint
    */
-  buildUrl(endpoint, region = 'vn2', isRegional = false) {
-    const baseUrl = isRegional ? this.baseUrls.asia : this.baseUrls[region];
-    return `${baseUrl}${endpoint}`;
+  buildUrl(endpoint, platform = 'vn2', isRegional = false) {
+    if (isRegional) {
+      // Use regional routing (sea, asia, americas, europe)
+      const regionalRoute = this.getRegionalRouting(platform);
+      const baseUrl = this.baseUrls[regionalRoute];
+      return `${baseUrl}${endpoint}`;
+    } else {
+      // Use platform endpoint (vn2, sg2, etc.)
+      const baseUrl = this.baseUrls[platform] || this.baseUrls.vn2;
+      return `${baseUrl}${endpoint}`;
+    }
   }
 }
 
@@ -182,71 +236,118 @@ const apiClient = new RiotApiClient();
 const riotApi = {
   /**
    * Get account by Riot ID (GameName#TagLine)
+   * Note: Account-v1 uses regional routing
+   * IMPORTANT: SEA routing deprecated for Account-v1, use ASIA instead
    */
-  async getAccountByRiotId(gameName, tagLine) {
-    const url = apiClient.buildUrl(
-      `/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`,
-      'asia',
-      true
-    );
-    return apiClient.request(url, 'asia');
+  async getAccountByRiotId(gameName, tagLine, platform = config.riot.region) {
+    // Override regional routing for Account-v1 API
+    // SEA platforms (vn2, sg2, th2, tw2, ph2) must use ASIA routing
+    const seaPlatforms = ['vn2', 'sg2', 'th2', 'tw2', 'ph2'];
+    let routingOverride = null;
+
+    if (seaPlatforms.includes(platform.toLowerCase())) {
+      routingOverride = 'asia'; // Force ASIA routing for SEA platforms
+    }
+
+    // Build URL with override if needed
+    let baseUrl;
+    if (routingOverride) {
+      baseUrl = apiClient.baseUrls[routingOverride];
+    } else {
+      const regionalRoute = apiClient.getRegionalRouting(platform);
+      baseUrl = apiClient.baseUrls[regionalRoute];
+    }
+
+    const url = `${baseUrl}/riot/account/v1/accounts/by-riot-id/${encodeURIComponent(gameName)}/${encodeURIComponent(tagLine)}`;
+    return apiClient.request(url, platform);
   },
 
   /**
    * Get summoner by PUUID
    */
-  async getSummonerByPuuid(puuid, region = 'vn2') {
+  async getSummonerByPuuid(puuid, platform = config.riot.region) {
     const url = apiClient.buildUrl(
       `/lol/summoner/v4/summoners/by-puuid/${puuid}`,
-      region
+      platform,
+      false // platform endpoint
     );
-    return apiClient.request(url, region);
+    return apiClient.request(url, platform);
   },
 
   /**
    * Get ranked stats for summoner by Summoner ID (legacy)
    */
-  async getRankedStats(summonerId, region = 'vn2') {
+  async getRankedStats(summonerId, platform = config.riot.region) {
     const url = apiClient.buildUrl(
       `/lol/league/v4/entries/by-summoner/${summonerId}`,
-      region
+      platform,
+      false
     );
-    return apiClient.request(url, region);
+    return apiClient.request(url, platform);
   },
 
   /**
    * Get ranked stats by PUUID (NEW - preferred method)
    */
-  async getRankedStatsByPuuid(puuid, region = 'vn2') {
+  async getRankedStatsByPuuid(puuid, platform = config.riot.region) {
     const url = apiClient.buildUrl(
       `/lol/league/v4/entries/by-puuid/${puuid}`,
-      region
+      platform,
+      false
     );
-    return apiClient.request(url, region);
+    return apiClient.request(url, platform);
   },
 
   /**
    * Get match IDs by PUUID
+   * Note: Match-v5 uses regional routing (SEA for Vietnam)
+   * @param {string} puuid - Player PUUID
+   * @param {number} count - Number of matches to fetch
+   * @param {number} start - Starting index
+   * @param {string} platform - Platform/region
+   * @param {string} type - Match type filter: 'ranked', 'normal', 'tourney', 'tutorial' (optional)
+   * @param {string} queue - Queue ID filter (optional) - e.g., 420 for Solo/Duo, 440 for Flex
    */
-  async getMatchIdsByPuuid(puuid, count = 20, start = 0) {
+  async getMatchIdsByPuuid(puuid, count = 20, start = 0, platform = config.riot.region, type = null, queue = null) {
+    let queryParams = `start=${start}&count=${count}`;
+    
+    // Add type filter if specified
+    if (type) {
+      queryParams += `&type=${type}`;
+    }
+    
+    // Add queue filter if specified
+    if (queue) {
+      queryParams += `&queue=${queue}`;
+    }
+    
     const url = apiClient.buildUrl(
-      `/lol/match/v5/matches/by-puuid/${puuid}/ids?start=${start}&count=${count}`,
-      'asia',
-      true
+      `/lol/match/v5/matches/by-puuid/${puuid}/ids?${queryParams}`,
+      platform,
+      true // isRegional - will use SEA for vn2
     );
-    return apiClient.request(url, 'asia');
+    return apiClient.request(url, platform);
+  },
+
+  /**
+   * Get RANKED match IDs by PUUID (Solo/Duo + Flex only)
+   * This is a convenience wrapper for getMatchIdsByPuuid with type='ranked'
+   */
+  async getRankedMatchIdsByPuuid(puuid, count = 20, start = 0, platform = config.riot.region) {
+    return this.getMatchIdsByPuuid(puuid, count, start, platform, 'ranked', null);
   },
 
   /**
    * Get match details by match ID
+   * Note: Match-v5 uses regional routing (SEA for Vietnam)
    */
-  async getMatchById(matchId) {
+  async getMatchById(matchId, platform = config.riot.region) {
     const url = apiClient.buildUrl(
       `/lol/match/v5/matches/${matchId}`,
-      'asia',
-      true
+      platform,
+      true // isRegional
     );
-    return apiClient.request(url, 'asia');
+    return apiClient.request(url, platform);
   },
 
   /**

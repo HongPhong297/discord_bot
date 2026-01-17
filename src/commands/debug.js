@@ -27,6 +27,21 @@ module.exports = {
       subcommand
         .setName('users')
         .setDescription('List all linked users (admin)')
+    )
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('cleanup')
+        .setDescription('Clean up stuck/incomplete match documents (admin)')
+    )
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('dbmatches')
+        .setDescription('List all match documents in database (admin)')
+    )
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('resetall')
+        .setDescription('Reset all matches and leaderboard data (admin)')
     ),
 
   async execute(interaction) {
@@ -47,6 +62,12 @@ module.exports = {
           break;
         case 'users':
           await debugUsers(interaction);
+          break;
+        case 'cleanup':
+          await debugCleanup(interaction);
+          break;
+        case 'dbmatches':
+          await debugDbMatches(interaction);
           break;
       }
     } catch (error) {
@@ -183,7 +204,84 @@ async function debugUsers(interaction) {
   });
 
   const embed = new EmbedBuilder()
-    .setTitle('👥 Linked Users')
+    .setTitle('Linked Users')
+    .setColor(COLORS.INFO)
+    .setDescription(description)
+    .setTimestamp();
+
+  await interaction.editReply({ embeds: [embed] });
+}
+
+async function debugCleanup(interaction) {
+  // Find all match documents with issues
+  const allMatches = await db.models.Match.find({});
+  
+  let description = `**Total matches in DB:** ${allMatches.length}\n\n`;
+  
+  // Categorize matches
+  const fullyProcessed = allMatches.filter(m => m.participants && m.participants.length > 0);
+  const emptyParticipants = allMatches.filter(m => !m.participants || m.participants.length === 0);
+  const stuckProcessing = emptyParticipants.filter(m => m.processing === true || m.claimedAt);
+  const orphaned = emptyParticipants.filter(m => !m.processing && !m.claimedAt);
+  
+  description += `Fully processed: **${fullyProcessed.length}**\n`;
+  description += `Empty participants: **${emptyParticipants.length}**\n`;
+  description += `  - Stuck processing: ${stuckProcessing.length}\n`;
+  description += `  - Orphaned: ${orphaned.length}\n\n`;
+  
+  if (emptyParticipants.length > 0) {
+    // Delete all documents with empty participants
+    const deleteResult = await db.models.Match.deleteMany({
+      $or: [
+        { participants: { $exists: false } },
+        { participants: { $size: 0 } },
+      ]
+    });
+    
+    description += `**CLEANED UP:** Deleted ${deleteResult.deletedCount} bad documents\n`;
+    log.info(`Cleanup: Deleted ${deleteResult.deletedCount} match documents with empty participants`);
+  } else {
+    description += `No cleanup needed - all documents are valid.`;
+  }
+  
+  const embed = new EmbedBuilder()
+    .setTitle('Database Cleanup')
+    .setColor(emptyParticipants.length > 0 ? COLORS.SUCCESS : COLORS.INFO)
+    .setDescription(description)
+    .setTimestamp();
+
+  await interaction.editReply({ embeds: [embed] });
+}
+
+async function debugDbMatches(interaction) {
+  const matches = await db.models.Match.find({}).sort({ timestamp: -1 }).limit(10);
+  
+  if (matches.length === 0) {
+    const embed = createInfoEmbed('No Matches', 'No match documents in database.');
+    return await interaction.editReply({ embeds: [embed] });
+  }
+  
+  let description = `**${matches.length}** recent match documents:\n\n`;
+  
+  for (const match of matches) {
+    const participantCount = match.participants?.length || 0;
+    const status = participantCount > 0 ? 'OK' : (match.processing ? 'PROCESSING' : 'EMPTY');
+    
+    description += `\`${match.matchId?.slice(-12) || 'N/A'}\`\n`;
+    description += `  Status: **${status}** | Participants: ${participantCount}\n`;
+    
+    if (match.claimedAt) {
+      const age = Math.round((Date.now() - new Date(match.claimedAt).getTime()) / (1000 * 60));
+      description += `  Claimed: ${age}m ago\n`;
+    }
+    if (match.timestamp) {
+      description += `  Game: ${match.timestamp.toISOString().split('T')[0]}\n`;
+    }
+    description += '\n';
+  }
+  
+  const embed = new EmbedBuilder()
+    .setTitle('Match Documents')
     .setColor(COLORS.INFO)
     .setDescription(description)
     .setTimestamp();

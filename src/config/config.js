@@ -82,12 +82,15 @@ const config = {
     postGame: {
       minPlayersRequired: 2, // Minimum Discord members in match to analyze
       autoRefreshInterval: 10, // Minutes between auto-refresh checks
+      matchType: 'ranked', // Filter: 'ranked', 'normal', 'tourney', 'tutorial', or null for all
+      // Queue IDs reference: 420 = Solo/Duo, 440 = Flex, 450 = ARAM, 400 = Normal Draft
     },
 
     // Betting system
     betting: {
-      bettingWindowDuration: 5, // Minutes
-      maxMatchWaitTime: 40, // Minutes to wait for match after betting opens
+      bettingWindowDuration: 5, // Minutes - thời gian mở cửa cược
+      maxMatchWaitTime: 90, // Minutes - chờ game BẮT ĐẦU + game KẾT THÚC (40 + 50 = 90)
+      maxGameStartWindow: 40, // Minutes - game phải BẮT ĐẦU trong 40 phút sau khi bet opens
       cancellationPenalty: 50, // Coins penalty for opening bet but not playing
       initialCoins: 1000, // Starting coins for new users
       houseEdge: 0.05, // 5% house edge on bets

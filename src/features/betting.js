@@ -420,22 +420,81 @@ async function getBalance(userId) {
 
 /**
  * Cleanup expired bet windows
+ * Called by cron job every 5 minutes
+ * This handles cases where setTimeout was lost (bot restart)
  */
-async function cleanupExpiredWindows() {
+async function cleanupExpiredWindows(client) {
   try {
     log.info('Cleaning up expired bet windows...');
 
     const cutoffTime = new Date();
-    cutoffTime.setMinutes(cutoffTime.getMinutes() - (config.features.betting.maxMatchWaitTime + 10));
+    cutoffTime.setMinutes(cutoffTime.getMinutes() - config.features.betting.maxMatchWaitTime);
 
+    // Find windows that are still "closed" but past the max wait time
     const expiredWindows = await db.models.BetWindow.find({
       status: 'closed',
       closedAt: { $lte: cutoffTime },
     });
 
+    if (expiredWindows.length === 0) {
+      log.debug('No expired bet windows to clean up');
+      return;
+    }
+
     for (const window of expiredWindows) {
-      window.status = 'cancelled';
-      await window.save();
+      try {
+        // Mark as cancelled
+        window.status = 'cancelled';
+        await window.save();
+
+        // Refund all bets for this window
+        const bets = await db.models.Bet.find({
+          openedAt: window.openedAt,
+          targetUserId: window.userId,
+          result: 'pending',
+        });
+
+        for (const bet of bets) {
+          const user = await db.models.User.findOne({ discordId: bet.userId });
+          if (user) {
+            user.currency += bet.amount;
+            await user.save();
+            log.info(`Refunded ${bet.amount} coins to user ${bet.userId}`);
+          }
+
+          bet.result = 'cancelled';
+          await bet.save();
+        }
+
+        // Penalize the window opener
+        const opener = await db.models.User.findOne({ discordId: window.userId });
+        if (opener) {
+          opener.currency -= config.features.betting.cancellationPenalty;
+          await opener.save();
+          log.info(`Penalized opener ${window.userId} with ${config.features.betting.cancellationPenalty} coins`);
+        }
+
+        // Notify in channel (if client is provided)
+        if (client) {
+          try {
+            const channel = await client.channels.fetch(config.discord.trackedChannelId);
+            const { createInfoEmbed } = require('../utils/embedBuilder');
+            const embed = createInfoEmbed(
+              'Cuoc bi huy (Cleanup)',
+              `<@${window.userId}> khong vao game trong ${config.features.betting.maxMatchWaitTime} phut.\n` +
+              `Tat ca coins da duoc hoan tra.\n` +
+              `Phat: ${config.features.betting.cancellationPenalty} coins.`
+            );
+            await channel.send({ embeds: [embed] });
+          } catch (channelError) {
+            log.warn('Could not send cleanup notification to channel', channelError);
+          }
+        }
+
+        log.bet('cancelled (cleanup)', window.userId);
+      } catch (windowError) {
+        log.error(`Error cleaning up window ${window._id}`, windowError);
+      }
     }
 
     log.info(`Cleaned up ${expiredWindows.length} expired bet windows`);
