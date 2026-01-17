@@ -113,6 +113,16 @@ async function syncUserRank(client, userId, guild = null) {
     user.lastRankSync = new Date();
     await user.save();
 
+    // Also update Leaderboard.highestRank for current week
+    const currentWeek = db.utils.getCurrentWeek();
+    const rankString = `${rankData.tier}_${rankData.rank}`;
+    await db.models.Leaderboard.findOneAndUpdate(
+      { userId, week: currentWeek },
+      { $set: { highestRank: rankString } },
+      { upsert: false } // Only update if exists, don't create new
+    );
+    log.debug('Updated leaderboard highestRank', { userId, week: currentWeek, rankString });
+
     log.info(`Synced rank for ${userId}`, {
       oldRank,
       newRank,
