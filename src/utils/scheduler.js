@@ -125,13 +125,14 @@ function initializeScheduledTasks(handlers) {
 
   // Daily reminder to refresh Riot API key (at 8 AM)
   // Development keys expire every 24 hours
-  if (config.app.isDevelopment) {
-    scheduler.schedule(
-      'api-key-reminder',
-      '0 8 * * *',
-      handlers.apiKeyReminder
-    );
-  }
+  // DISABLED: Production API key obtained - no longer expires every 24h
+  // if (config.app.isDevelopment) {
+  //   scheduler.schedule(
+  //     'api-key-reminder',
+  //     '0 8 * * *',
+  //     handlers.apiKeyReminder
+  //   );
+  // }
 
   log.info('Scheduled tasks initialized', {
     jobs: scheduler.getJobs(),
