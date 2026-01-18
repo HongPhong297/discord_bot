@@ -94,13 +94,16 @@ async function checkForNewMatches(client) {
             }
 
             // STEP 3: Now try to claim the match atomically (with timestamp since we have it)
+            // Generate unique claim token to detect race conditions between instances
+            const claimToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
             const claimResult = await db.models.Match.findOneAndUpdate(
               { matchId },
-              { 
-                $setOnInsert: { 
-                  matchId, 
+              {
+                $setOnInsert: {
+                  matchId,
                   processing: true,
                   claimedAt: new Date(),
+                  claimToken, // Unique token to identify who claimed
                   timestamp: new Date(matchData.info.gameCreation),
                 }
               },
@@ -110,6 +113,12 @@ async function checkForNewMatches(client) {
             // If document already had participants, someone else processed it
             if (claimResult.participants && claimResult.participants.length > 0) {
               log.debug(`Match ${matchId} was already processed by another instance, skipping`);
+              continue;
+            }
+
+            // If our claim token doesn't match, another instance claimed it first
+            if (claimResult.claimToken !== claimToken) {
+              log.debug(`Match ${matchId} was claimed by another instance (token mismatch), skipping`);
               continue;
             }
 
@@ -682,14 +691,17 @@ async function checkMatchesForUser(client, discordId) {
 
         // STEP 3: Now try to claim the match atomically (with timestamp since we have it)
         // Use findOneAndUpdate with $setOnInsert for atomic claim
+        // Generate unique claim token to detect race conditions between instances
+        const claimToken = `${discordId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const claimResult = await db.models.Match.findOneAndUpdate(
           { matchId },
-          { 
-            $setOnInsert: { 
-              matchId, 
+          {
+            $setOnInsert: {
+              matchId,
               processing: true,
               claimedAt: new Date(),
-              timestamp: new Date(matchData.info.gameCreation), // Include timestamp!
+              claimToken, // Unique token to identify who claimed
+              timestamp: new Date(matchData.info.gameCreation),
             }
           },
           { upsert: true, new: true }
@@ -699,6 +711,14 @@ async function checkMatchesForUser(client, discordId) {
         if (claimResult.participants && claimResult.participants.length > 0) {
           log.debug(`Match ${matchId} was already processed by another instance, skipping`);
           result.skippedAlreadyProcessed++;
+          continue;
+        }
+
+        // If our claim token doesn't match, another instance claimed it first
+        if (claimResult.claimToken !== claimToken) {
+          log.debug(`Match ${matchId} was claimed by another instance (token mismatch), skipping`);
+          result.skippedAlreadyProcessed++;
+          result.debugInfo.push(`${matchId.slice(-8)}: claimed by another`);
           continue;
         }
 

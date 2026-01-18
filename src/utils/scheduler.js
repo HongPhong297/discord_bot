@@ -23,6 +23,14 @@ class Scheduler {
    */
   schedule(name, cronExpression, task) {
     try {
+      // Prevent duplicate jobs with same name
+      const existingIndex = this.jobs.findIndex(j => j.name === name);
+      if (existingIndex !== -1) {
+        log.warn(`Job "${name}" already exists, stopping old job first`);
+        this.jobs[existingIndex].job.stop();
+        this.jobs.splice(existingIndex, 1);
+      }
+
       const job = cron.schedule(cronExpression, async () => {
         log.info(`Running scheduled task: ${name}`);
         try {
